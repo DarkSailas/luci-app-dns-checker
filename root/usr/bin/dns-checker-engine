@@ -1,0 +1,1196 @@
+#!/bin/sh
+# ==============================================================================
+# DNS Checker Engine for OpenWrt
+# High-performance DNS benchmarking, health check and configuration applicator
+# Version: 1.2.7
+# ==============================================================================
+
+VERSION="1.2.7"
+REPO_BASE="https://raw.githubusercontent.com/DarkSailas/luci-app-dns-checker/main"
+BACKUP_DIR="/etc/dns-checker"
+CONFIG_FILE="/etc/config/dns-checker"
+mkdir -p "$BACKUP_DIR"
+
+# Ensure config file exists
+[ -f "$CONFIG_FILE" ] || touch "$CONFIG_FILE"
+
+TEST_DOMAIN="google.com"
+
+# Failover: the daemon probes the primary DNS of podkop and, while it is silent,
+# puts the backup server into the running sing-box configuration
+STATE_DIR="/tmp/dns-checker"
+FO_INIT="/etc/init.d/dns-checker"
+FO_INIT_MARK="# dns-checker failover service 1"
+FO_INTERVAL=30
+FO_RETURN_CHECKS=10
+# Every switch restarts sing-box and breaks the open connections. After the second
+# failure of the primary server within a day the backup one stays until this hour
+FO_HOLD_FAILS=2
+FO_HOLD_HOUR=4
+# Servers that take over when both the primary and the backup one are silent
+FO_RESERVE="195.208.5.1 62.76.62.76"
+SB_CONFIG=$(uci -q get podkop.settings.config_path)
+[ -n "$SB_CONFIG" ] || SB_CONFIG="/etc/sing-box/config.json"
+
+# Where to send a DoH or DoT probe. The resolver of the router goes through the DNS
+# in use, and a provider may answer with a stub for its own name (COMSS gives
+# 127.0.1.1), or podkop may give a fake address. Then the name is asked from the
+# bootstrap server; otherwise the name itself is kept
+bench_ip() {
+    local ip
+    ip=$(dig "$1" A +short +timeout=2 +tries=1 2>/dev/null | grep -E '^[0-9]+.[0-9]+.[0-9]+.[0-9]+$' | head -n 1)
+    case "$ip" in
+        ""|127.*|0.*|198.18.*|198.19.*) ;;
+        *) echo "$1"; return ;;
+    esac
+    ip=$(dig "@${2:-195.208.5.1}" "$1" A +short +timeout=2 +tries=1 2>/dev/null | grep -E '^[0-9]+.[0-9]+.[0-9]+.[0-9]+$' | head -n 1)
+    echo "${ip:-$1}"
+}
+
+# ------------------------------------------------------------------------------
+# Action: Benchmark all providers in parallel with 10-probe statistical averaging
+# ------------------------------------------------------------------------------
+action_test() {
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/dns-bench.XXXXXX)
+    local count=0
+
+    # 1. Built-in providers
+    for p in \
+      'comss|COMSS One|83.220.169.155|https://dns.comss.one/dns-query|dns.comss.one|195.208.5.1' \
+      'comss2|COMSS Router|212.109.195.93|https://router.comss.one/dns-query|router.comss.one|195.208.5.1' \
+      'nextdns|NextDNS|45.90.28.80|https://dns.nextdns.io/dns-query|dns.nextdns.io|185.222.222.222' \
+      'adguard|AdGuard DNS|94.140.14.14|https://dns.adguard-dns.com/dns-query|dns.adguard-dns.com|45.90.28.80' \
+      'cloudflare|Cloudflare|1.1.1.1|https://cloudflare-dns.com/dns-query|1.1.1.1|45.90.28.80' \
+      'google|Google Public|8.8.8.8|https://dns.google/dns-query|dns.google|45.90.28.80' \
+      'quad9|Quad9|9.9.9.9|https://dns.quad9.net/dns-query|dns.quad9.net|45.90.28.80' \
+      'dnssb|DNS.SB|185.222.222.222|https://doh.dns.sb/dns-query|dot.sb|45.90.28.80' \
+      'he|Hurricane Electric|74.82.42.42|https://ordns.he.net/dns-query|ordns.he.net|45.90.28.80' \
+      'skydns|SkyDNS|193.58.251.251|||195.208.5.1' \
+      'xboxdns|XboxDNS|0.0.0.0|https://xbox-dns.ru/dns-query|xbox-dns.ru|195.208.5.1' \
+      'yandex|Yandex DNS|77.88.8.8|https://common.dot.dns.yandex.net/dns-query|common.dot.dns.yandex.net|195.208.5.1'; do
+        count=$((count + 1))
+        (
+            IFS='|' read -r id name udp doh dot boot << EOF
+$p
+EOF
+            local pdir="$tmpdir/$count"
+            mkdir -p "$pdir"
+            name=$(echo "$name" | tr -d '\r\n"')
+
+            # Static / fast POP detection
+            local loc="Anycast"
+            case "$id" in
+                cloudflare) loc="RU MSK" ;;
+                yandex|comss|comss2|skydns|xboxdns) loc="RU MSK" ;;
+                google) loc="Anycast" ;;
+                quad9) loc="FI HEL" ;;
+                adguard) loc="SE ARN" ;;
+                nextdns) loc="Anycast" ;;
+                *) loc="Anycast" ;;
+            esac
+
+            # Hijacking canary check (verified: only flags if answered with fake IP)
+            local is_hijacked="false"
+            if [ -n "$udp" ] && [ "$udp" != "0.0.0.0" ]; then
+                local canary_ip
+                canary_ip=$(dig "@$udp" dns.google +short +timeout=1 +tries=1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+                if [ -n "$canary_ip" ]; then
+                    if [ "$canary_ip" != "8.8.8.8" ] && [ "$canary_ip" != "8.8.4.4" ]; then
+                        is_hijacked="true"
+                    fi
+                fi
+                # youtube.com exists for every honest server; "no such name" means the
+                # answer was replaced on the way or the server itself censors
+                if [ "$is_hijacked" = "false" ] && dig "@$udp" youtube.com A +timeout=1 +tries=1 2>/dev/null | grep -q 'status: NXDOMAIN'; then
+                    is_hijacked="true"
+                fi
+            fi
+
+            # Protocol 1: UDP (10 probes in parallel)
+            (
+                local u_sum=0 u_cnt=0
+                if [ -n "$udp" ] && [ "$udp" != "0.0.0.0" ]; then
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        out=$(dig "@$udp" "$TEST_DOMAIN" +timeout=1 +tries=1 2>/dev/null)
+                        if echo "$out" | grep -q 'status: NOERROR'; then
+                            ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                            [ -z "$ms" ] && ms=0
+                            u_sum=$((u_sum + ms))
+                            u_cnt=$((u_cnt + 1))
+                        elif [ "$u_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                            break
+                        fi
+                    done
+                fi
+                [ "$u_cnt" -gt 0 ] && echo $((u_sum / u_cnt)) > "$pdir/udp" || echo "-1" > "$pdir/udp"
+            ) &
+
+            # Protocol 2: DoH (10 probes in parallel)
+            (
+                local d_sum=0 d_cnt=0
+                if [ -n "$doh" ] && [ "$doh" != "none" ]; then
+                    local host path
+                    host=$(echo "$doh" | awk -F[/:] '{print $4}')
+                    path="/$(echo "$doh" | cut -d'/' -f4-)"
+                    local hip
+                    hip=$(bench_ip "$host" "$boot")
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        out=$(dig "@$hip" "$TEST_DOMAIN" +https="$path" +timeout=1 +tries=1 2>/dev/null)
+                        if echo "$out" | grep -q 'status: NOERROR'; then
+                            ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                            [ -z "$ms" ] && ms=0
+                            d_sum=$((d_sum + ms))
+                            d_cnt=$((d_cnt + 1))
+                        else
+                            # dig cannot name the host when it is given an address; the time of the
+                            # exchange alone is taken, without the connection setup, as dig counts it
+                            out_curl=$(curl -s -o /dev/null -w "%{time_appconnect} %{time_total}" --max-time 2 $(is_ip "$hip" && echo "--resolve $host:443:$hip") "$doh?dns=AAABAAABAAAAAAAAA3d3dwZnb29nbGUDY29tAAABAAE" -H "accept: application/dns-message" 2>/dev/null)
+                            if [ $? -eq 0 ] && [ -n "$out_curl" ] && [ "${out_curl#* }" != "0.000000" ]; then
+                                ms=$(echo "$out_curl" | awk '{print int(($2 - $1) * 1000)}')
+                                d_sum=$((d_sum + ms))
+                                d_cnt=$((d_cnt + 1))
+                            elif [ "$d_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        fi
+                    done
+                fi
+                [ "$d_cnt" -gt 0 ] && echo $((d_sum / d_cnt)) > "$pdir/doh" || echo "-1" > "$pdir/doh"
+            ) &
+
+            # Protocol 3: DoT (10 probes in parallel)
+            (
+                local t_sum=0 t_cnt=0
+                if [ -n "$dot" ] && [ "$dot" != "none" ]; then
+                    local tip
+                    tip=$(bench_ip "$dot" "$boot")
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        out=$(dig "@$tip" "$TEST_DOMAIN" +tls +timeout=1 +tries=1 2>/dev/null)
+                        if echo "$out" | grep -q 'status: NOERROR'; then
+                            ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                            [ -z "$ms" ] && ms=0
+                            t_sum=$((t_sum + ms))
+                            t_cnt=$((t_cnt + 1))
+                        elif [ "$t_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                            break
+                        fi
+                    done
+                fi
+                [ "$t_cnt" -gt 0 ] && echo $((t_sum / t_cnt)) > "$pdir/dot" || echo "-1" > "$pdir/dot"
+            ) &
+
+            wait
+
+            local u_ms d_ms t_ms
+            u_ms=$(cat "$pdir/udp" 2>/dev/null || echo -1)
+            d_ms=$(cat "$pdir/doh" 2>/dev/null || echo -1)
+            t_ms=$(cat "$pdir/dot" 2>/dev/null || echo -1)
+
+            cat << EOF > "$tmpdir/$count.json"
+{
+  "id": "$id",
+  "name": "$name",
+  "location": "$loc",
+  "hijacked": $is_hijacked,
+  "udp": { "address": "$udp", "latency": $u_ms, "status": $([ "$u_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "doh": { "address": "$doh", "latency": $d_ms, "status": $([ "$d_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "dot": { "address": "$dot", "latency": $t_ms, "status": $([ "$t_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "bootstrap": "$boot"
+}
+EOF
+        ) &
+    done
+
+    # 2. Append custom providers
+    if [ -s "$CONFIG_FILE" ]; then
+        local c_sections
+        c_sections=$(uci -q show dns-checker | grep '=custom_dns' | cut -d'.' -f2 | cut -d'=' -f1)
+        for s in $c_sections; do
+            count=$((count + 1))
+            (
+                local c_name c_udp c_doh c_dot c_boot
+                c_name=$(uci -q get "dns-checker.$s.name" || echo "$s")
+                c_name=$(echo "$c_name" | tr -d '\r\n"')
+                c_udp=$(uci -q get "dns-checker.$s.udp" || echo "")
+                c_doh=$(uci -q get "dns-checker.$s.doh" || echo "")
+                c_dot=$(uci -q get "dns-checker.$s.dot" || echo "")
+                c_boot=$(uci -q get "dns-checker.$s.boot" || echo "195.208.5.1")
+
+                local pdir="$tmpdir/$count"
+                mkdir -p "$pdir"
+
+                (
+                    local u_sum=0 u_cnt=0
+                    if [ -n "$c_udp" ] && [ "$c_udp" != "0.0.0.0" ]; then
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            out=$(dig "@$c_udp" "$TEST_DOMAIN" +timeout=1 +tries=1 2>/dev/null)
+                            if echo "$out" | grep -q 'status: NOERROR'; then
+                                ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                                [ -z "$ms" ] && ms=0
+                                u_sum=$((u_sum + ms))
+                                u_cnt=$((u_cnt + 1))
+                            elif [ "$u_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        done
+                    fi
+                    [ "$u_cnt" -gt 0 ] && echo $((u_sum / u_cnt)) > "$pdir/udp" || echo "-1" > "$pdir/udp"
+                ) &
+
+                (
+                    local d_sum=0 d_cnt=0
+                    if [ -n "$c_doh" ]; then
+                        local host path
+                        host=$(echo "$c_doh" | awk -F[/:] '{print $4}')
+                        path="/$(echo "$c_doh" | cut -d'/' -f4-)"
+                        local hip
+                        hip=$(bench_ip "$host" "$c_boot")
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            out=$(dig "@$hip" "$TEST_DOMAIN" +https="$path" +timeout=1 +tries=1 2>/dev/null)
+                            if echo "$out" | grep -q 'status: NOERROR'; then
+                                ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                                [ -z "$ms" ] && ms=0
+                                d_sum=$((d_sum + ms))
+                                d_cnt=$((d_cnt + 1))
+                            elif [ "$d_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        done
+                    fi
+                    [ "$d_cnt" -gt 0 ] && echo $((d_sum / d_cnt)) > "$pdir/doh" || echo "-1" > "$pdir/doh"
+                ) &
+
+                (
+                    local t_sum=0 t_cnt=0
+                    if [ -n "$c_dot" ]; then
+                        local tip
+                        tip=$(bench_ip "$c_dot" "$c_boot")
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            out=$(dig "@$tip" "$TEST_DOMAIN" +tls +timeout=1 +tries=1 2>/dev/null)
+                            if echo "$out" | grep -q 'status: NOERROR'; then
+                                ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                                [ -z "$ms" ] && ms=0
+                                t_sum=$((t_sum + ms))
+                                t_cnt=$((t_cnt + 1))
+                            elif [ "$t_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        done
+                    fi
+                    [ "$t_cnt" -gt 0 ] && echo $((t_sum / t_cnt)) > "$pdir/dot" || echo "-1" > "$pdir/dot"
+                ) &
+
+                wait
+
+                local u_ms d_ms t_ms
+                u_ms=$(cat "$pdir/udp" 2>/dev/null || echo -1)
+                d_ms=$(cat "$pdir/doh" 2>/dev/null || echo -1)
+                t_ms=$(cat "$pdir/dot" 2>/dev/null || echo -1)
+
+                cat << EOF > "$tmpdir/$count.json"
+{
+  "id": "$s",
+  "name": "$c_name",
+  "location": "Custom",
+  "hijacked": false,
+  "udp": { "address": "$c_udp", "latency": $u_ms, "status": $([ "$u_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "doh": { "address": "$c_doh", "latency": $d_ms, "status": $([ "$d_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "dot": { "address": "$c_dot", "latency": $t_ms, "status": $([ "$t_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "bootstrap": "$c_boot"
+}
+EOF
+            ) &
+        done
+    fi
+
+    wait
+
+    local first=1
+    echo "{\"timestamp\": $(date +%s), \"probes\": 10, \"providers\": ["
+    for f in $(ls "$tmpdir"/*.json 2>/dev/null | sort -n); do
+        [ $first -eq 0 ] && echo ","
+        cat "$f"
+        first=0
+    done
+    echo "]}"
+    rm -rf "$tmpdir"
+}
+
+# ------------------------------------------------------------------------------
+# Action: Real DNS Leak Test (Identifying outgoing resolver)
+# ------------------------------------------------------------------------------
+action_leak_test() {
+    local ext_ip=""
+    ext_ip=$(dig +short whoami.akamai.net 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+
+    if [ -z "$ext_ip" ]; then
+        ext_ip=$(dig +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null | tr -d '"' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+    fi
+
+    if [ -z "$ext_ip" ]; then
+        ext_ip="127.0.0.1"
+    fi
+
+    local provider_name="Неизвестный резолвер"
+    local secure=1
+
+    case "$ext_ip" in
+        83.220.169.*|212.109.195.*) provider_name="COMSS One" ;;
+        77.88.*) provider_name="Yandex DNS" ;;
+        45.90.*) provider_name="NextDNS" ;;
+        94.140.*) provider_name="AdGuard DNS" ;;
+        1.1.1.*|172.64.*|162.158.*) provider_name="Cloudflare DNS" ;;
+        8.8.*|172.217.*|142.250.*|66.249.*) provider_name="Google Public DNS" ;;
+        9.9.*|149.112.*) provider_name="Quad9 DNS" ;;
+        *) provider_name="Внешний узел ($ext_ip)" ;;
+    esac
+
+    cat << EOF
+{
+  "status": "ok",
+  "resolver_ip": "$ext_ip",
+  "provider": "$provider_name",
+  "secure": $secure
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Action: Custom DNS management (add / delete)
+# ------------------------------------------------------------------------------
+action_add_custom() {
+    local id="$1"
+    local name="$2"
+    local udp="$3"
+    local doh="$4"
+    local dot="$5"
+    local boot="$6"
+
+    [ -z "$id" ] && id="custom_$(date +%s)"
+    [ -z "$boot" ] && boot="195.208.5.1"
+
+    uci set "dns-checker.$id=custom_dns"
+    uci set "dns-checker.$id.name=$name"
+    [ -n "$udp" ] && uci set "dns-checker.$id.udp=$udp"
+    [ -n "$doh" ] && uci set "dns-checker.$id.doh=$doh"
+    [ -n "$dot" ] && uci set "dns-checker.$id.dot=$dot"
+    uci set "dns-checker.$id.boot=$boot"
+    uci commit dns-checker
+
+    echo "{\"status\": \"ok\", \"message\": \"Кастомный DNS успешно добавлен\", \"id\": \"$id\"}"
+}
+
+action_del_custom() {
+    local id="$1"
+    if [ -n "$id" ]; then
+        uci -q del "dns-checker.$id"
+        uci commit dns-checker
+        echo "{\"status\": \"ok\", \"message\": \"Кастомный DNS удален\"}"
+    else
+        echo "{\"status\": \"error\", \"message\": \"ID не указан\"}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Check for update on GitHub
+# ------------------------------------------------------------------------------
+action_check_update() {
+    local remote_ver
+    remote_ver=$(curl -sSL --max-time 4 "$REPO_BASE/root/usr/bin/dns-checker-engine" 2>/dev/null | grep '^VERSION=' | head -n 1 | cut -d'"' -f2)
+    [ -z "$remote_ver" ] && remote_ver="$VERSION"
+
+    local has_upd="false"
+    [ "$VERSION" != "$remote_ver" ] && has_upd="true"
+
+    cat << EOF
+{
+  "local_version": "$VERSION",
+  "remote_version": "$remote_ver",
+  "has_update": $has_upd
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Action: the benchmark in the background. It takes 20-25 s, LuCI drops a call
+# after 20 s, so the page starts it here and polls test_result
+# ------------------------------------------------------------------------------
+BENCH_OUT="$STATE_DIR/bench.json"
+BENCH_PID="$STATE_DIR/bench.pid"
+
+bench_running() {
+    local pid
+    pid=$(cat "$BENCH_PID" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+action_test_start() {
+    mkdir -p "$STATE_DIR"
+    if bench_running; then
+        echo '{"status": "running"}'
+        return 0
+    fi
+    rm -f "$BENCH_OUT" "$BENCH_OUT.tmp"
+    (
+        "$0" test > "$BENCH_OUT.tmp" 2>/dev/null
+        mv -f "$BENCH_OUT.tmp" "$BENCH_OUT"
+        rm -f "$BENCH_PID"
+    ) < /dev/null > /dev/null 2>&1 &
+    echo $! > "$BENCH_PID"
+    echo '{"status": "started"}'
+}
+
+action_test_result() {
+    if [ -s "$BENCH_OUT" ]; then
+        cat "$BENCH_OUT"
+    elif bench_running; then
+        echo '{"status": "running"}'
+    else
+        echo '{"status": "none"}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Current system status (Checking sing-box daemon process & configs)
+# ------------------------------------------------------------------------------
+action_status() {
+    local podkop_running=0
+    if pidof sing-box >/dev/null 2>&1 || pgrep -f sing-box >/dev/null 2>&1; then
+        podkop_running=1
+    elif [ -x /usr/bin/podkop ] && /usr/bin/podkop get_sing_box_status 2>/dev/null | grep -q '"running":1'; then
+        podkop_running=1
+    elif /etc/init.d/podkop status 2>/dev/null | grep -q "running"; then
+        podkop_running=1
+    fi
+
+    local pk_type pk_server pk_backup_type pk_backup pk_boot
+    pk_type=$(uci -q get podkop.settings.dns_type || echo "udp")
+    pk_server=$(uci -q get podkop.settings.dns_server || echo "")
+    pk_boot=$(uci -q get podkop.settings.bootstrap_dns_server || echo "195.208.5.1")
+
+    local wan_dns
+    wan_dns=$(uci -q get network.wan.dns || echo "")
+
+    local custom_json=""
+    if [ -s "$CONFIG_FILE" ]; then
+        local c_sections
+        c_sections=$(uci -q show dns-checker | grep '=custom_dns' | cut -d'.' -f2 | cut -d'=' -f1)
+        local c_first=1
+        for s in $c_sections; do
+            local c_name c_udp c_doh c_dot c_boot
+            c_name=$(uci -q get "dns-checker.$s.name" || echo "$s")
+            c_name=$(echo "$c_name" | tr -d '\r\n"')
+            c_udp=$(uci -q get "dns-checker.$s.udp" || echo "")
+            c_doh=$(uci -q get "dns-checker.$s.doh" || echo "")
+            c_dot=$(uci -q get "dns-checker.$s.dot" || echo "")
+            c_boot=$(uci -q get "dns-checker.$s.boot" || echo "195.208.5.1")
+            [ $c_first -eq 0 ] && custom_json="$custom_json,"
+            custom_json="$custom_json{\"id\":\"$s\",\"name\":\"$c_name\",\"udp\":\"$c_udp\",\"doh\":\"$c_doh\",\"dot\":\"$c_dot\",\"boot\":\"$c_boot\"}"
+            c_first=0
+        done
+    fi
+
+    # the page is opened after an update made by an older engine: bring the service up
+    fo_setup >/dev/null 2>&1
+    pk_backup_type="$FO_TYPE"
+    pk_backup="$FO_SERVER"
+    [ -n "$pk_backup_type" ] || pk_backup_type="udp"
+
+    local fo_hold="false" fo_tier fo_asrv
+    fo_tier=$(cat "$STATE_DIR/tier" 2>/dev/null || echo "backup")
+    fo_asrv=$(cat "$STATE_DIR/active_server" 2>/dev/null)
+    [ -f "$STATE_DIR/hold" ] && fo_hold="true"
+    local fo_enabled="false" fo_running="false" fo_active="false" fo_since=0 fo_last=0 fo_primary="null" fo_ev_time=0 fo_ev=""
+    [ -n "$FO_SERVER" ] && fo_enabled="true"
+    [ -x "$FO_INIT" ] && "$FO_INIT" running 2>/dev/null && fo_running="true"
+    if [ -f "$STATE_DIR/active" ]; then
+        fo_active="true"
+        fo_since=$(cat "$STATE_DIR/active" 2>/dev/null)
+    fi
+    fo_last=$(cat "$STATE_DIR/last_check" 2>/dev/null)
+    case "$(cat "$STATE_DIR/primary_state" 2>/dev/null)" in
+        ok) fo_primary="true" ;;
+        fail) fo_primary="false" ;;
+    esac
+    if [ -f "$STATE_DIR/last_event" ]; then
+        fo_ev_time=$(cut -d' ' -f1 "$STATE_DIR/last_event")
+        fo_ev=$(cut -d' ' -f2- "$STATE_DIR/last_event" | tr -d '"\\\r\n')
+    fi
+
+    cat << EOF
+{
+  "version": "$VERSION",
+  "podkop_running": $podkop_running,
+  "podkop": {
+    "dns_type": "$pk_type",
+    "dns_server": "$pk_server",
+    "backup_dns_type": "$pk_backup_type",
+    "backup_dns_server": "$pk_backup",
+    "bootstrap_dns_server": "$pk_boot"
+  },
+  "failover": {
+    "enabled": $fo_enabled,
+    "running": $fo_running,
+    "active": $fo_active,
+    "hold": $fo_hold,
+    "tier": "$fo_tier",
+    "active_server": "$fo_asrv",
+    "reserve": "$(echo $(fo_reserve_list))",
+    "hold_hour": $FO_HOLD_HOUR,
+    "since": ${fo_since:-0},
+    "last_check": ${fo_last:-0},
+    "primary_ok": $fo_primary,
+    "interval": $FO_INTERVAL,
+    "event_time": ${fo_ev_time:-0},
+    "event": "$fo_ev"
+  },
+  "router_wan_dns": "$wan_dns",
+  "custom_providers": [$custom_json],
+  "has_backup": $([ -f "$BACKUP_DIR/initial_backup.tar.gz" ] && echo "true" || echo "false")
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Action: Save initial backup if not present
+# ------------------------------------------------------------------------------
+action_backup() {
+    if [ ! -f "$BACKUP_DIR/initial_backup.tar.gz" ]; then
+        tar -czf "$BACKUP_DIR/initial_backup.tar.gz" \
+            /etc/config/podkop \
+            /etc/config/network \
+            /etc/config/dhcp \
+            /etc/config/dns-checker 2>/dev/null
+        echo '{"status": "ok", "message": "Initial backup created"}'
+    else
+        echo '{"status": "ok", "message": "Initial backup already exists"}'
+    fi
+}
+
+# Only the configuration files are taken out of an archive. Archives made by the
+# versions before 1.2.0 also hold /usr/bin/podkop, and unpacking that file would put
+# an old podkop script over the installed one
+restore_configs() {
+    local m
+    for m in etc/config/podkop etc/config/network etc/config/dhcp etc/config/dns-checker; do
+        tar -xzf "$1" -C / "$m" 2>/dev/null
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Action: Restore initial backup
+# ------------------------------------------------------------------------------
+action_restore() {
+    if [ -f "$BACKUP_DIR/initial_backup.tar.gz" ]; then
+        restore_configs "$BACKUP_DIR/initial_backup.tar.gz"
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        /etc/init.d/podkop restart >/dev/null 2>&1
+        fo_setup >/dev/null 2>&1
+        echo '{"status": "ok", "message": "Configuration restored from backup"}'
+    else
+        echo '{"status": "error", "message": "Backup file not found"}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Self-Update from GitHub repository
+# ------------------------------------------------------------------------------
+action_update() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/dns-update.XXXXXX)
+
+    curl -sSL "$REPO_BASE/root/usr/bin/dns-checker-engine" -o "$tmp_dir/dns-checker-engine"
+    curl -sSL "$REPO_BASE/root/usr/share/luci/menu.d/luci-app-dns-checker.json" -o "$tmp_dir/luci-app-dns-checker.json"
+    curl -sSL "$REPO_BASE/root/usr/share/rpcd/acl.d/luci-app-dns-checker.json" -o "$tmp_dir/luci-app-dns-checker.json.acl"
+    curl -sSL "$REPO_BASE/htdocs/luci-static/resources/view/dns-checker/main.js" -o "$tmp_dir/main.js"
+    curl -sSL "$REPO_BASE/htdocs/luci-static/resources/view/dns-checker/index.js" -o "$tmp_dir/index.js"
+    curl -sSL "$REPO_BASE/uninstall.sh" -o "$tmp_dir/uninstall.sh"
+    curl -sSL "$REPO_BASE/update.sh" -o "$tmp_dir/update.sh"
+
+    if [ -s "$tmp_dir/dns-checker-engine" ] && [ -s "$tmp_dir/main.js" ]; then
+        cp -f "$tmp_dir/dns-checker-engine" /usr/bin/dns-checker-engine.new
+        chmod 755 /usr/bin/dns-checker-engine.new
+        mv -f /usr/bin/dns-checker-engine.new /usr/bin/dns-checker-engine
+
+        cp -f "$tmp_dir/luci-app-dns-checker.json" /usr/share/luci/menu.d/luci-app-dns-checker.json
+        cp -f "$tmp_dir/luci-app-dns-checker.json.acl" /usr/share/rpcd/acl.d/luci-app-dns-checker.json
+        chmod 644 /usr/share/luci/menu.d/luci-app-dns-checker.json /usr/share/rpcd/acl.d/luci-app-dns-checker.json
+
+        cp -f "$tmp_dir/main.js" /www/luci-static/resources/view/dns-checker/main.js
+        cp -f "$tmp_dir/index.js" /www/luci-static/resources/view/dns-checker/index.js
+        chmod 644 /www/luci-static/resources/view/dns-checker/*.js
+
+        cp -f "$tmp_dir/uninstall.sh" "$BACKUP_DIR/uninstall.sh" 2>/dev/null || true
+        cp -f "$tmp_dir/update.sh" "$BACKUP_DIR/update.sh" 2>/dev/null || true
+        chmod 755 "$BACKUP_DIR/uninstall.sh" "$BACKUP_DIR/update.sh" 2>/dev/null || true
+
+        rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
+        /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+        /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+
+        rm -rf "$tmp_dir"
+        /usr/bin/dns-checker-engine failover_setup restart >/dev/null 2>&1 || true
+        echo '{"status": "ok", "message": "DNS Checker successfully updated to latest release."}'
+    else
+        rm -rf "$tmp_dir"
+        echo '{"status": "error", "message": "Failed to download update from GitHub."}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Failover of the podkop DNS
+# ------------------------------------------------------------------------------
+is_ip() {
+    echo "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+fo_log() {
+    logger -t dns-checker "$1"
+    mkdir -p "$STATE_DIR"
+    echo "$(date +%s) $1" > "$STATE_DIR/last_event"
+}
+
+# Sets FO_TYPE and FO_SERVER. The versions before 1.2.0 kept the backup server in
+# the podkop configuration and patched the podkop script to read it
+fo_load() {
+    FO_TYPE=$(uci -q get dns-checker.failover.type)
+    FO_SERVER=$(uci -q get dns-checker.failover.server)
+    local old
+    old=$(uci -q get podkop.settings.backup_dns_server)
+    if [ -z "$FO_SERVER" ] && [ -n "$old" ] && [ "$old" != "none" ]; then
+        fo_save "$(uci -q get podkop.settings.backup_dns_type || echo udp)" "$old"
+    fi
+    if [ -n "$old" ] || [ -n "$(uci -q get podkop.settings.backup_dns_type)" ]; then
+        uci -q del podkop.settings.backup_dns_type
+        uci -q del podkop.settings.backup_dns_server
+        uci commit podkop
+    fi
+    [ -n "$FO_TYPE" ] || FO_TYPE="udp"
+}
+
+fo_save() {
+    [ -f "$CONFIG_FILE" ] || touch "$CONFIG_FILE"
+    if [ -n "$2" ] && [ "$2" != "none" ]; then
+        uci set dns-checker.failover=failover
+        uci set dns-checker.failover.type="$1"
+        uci set dns-checker.failover.server="$2"
+        FO_TYPE="$1"
+        FO_SERVER="$2"
+    else
+        uci -q del dns-checker.failover
+        FO_SERVER=""
+    fi
+    uci commit dns-checker
+}
+
+# Splits a server address into D_HOST, D_PORT and D_PATH
+fo_parse() {
+    local addr="$2"
+    addr="${addr#https://}"
+    addr="${addr#tls://}"
+    D_HOST="${addr%%/*}"
+    D_PATH=""
+    case "$1" in
+        doh)
+            D_PORT=443
+            D_PATH="/dns-query"
+            case "$addr" in
+                */*) D_PATH="/${addr#*/}" ;;
+            esac
+            ;;
+        dot) D_PORT=853 ;;
+        *) D_PORT=53 ;;
+    esac
+    case "$D_HOST" in
+        *:*)
+            D_PORT="${D_HOST##*:}"
+            D_HOST="${D_HOST%%:*}"
+            ;;
+    esac
+}
+
+# One real query straight to the server, the way sing-box reaches it. A host name
+# is resolved by the bootstrap server: the resolver of the router itself answers
+# through the very server that is being checked
+fo_probe() {
+    fo_parse "$1" "$2"
+    local ip="$D_HOST" boot
+    if ! is_ip "$ip"; then
+        boot=$(uci -q get podkop.settings.bootstrap_dns_server || echo "195.208.5.1")
+        ip=$(dig "@$boot" "$D_HOST" A +short +timeout=2 +tries=1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+        [ -n "$ip" ] || return 1
+    fi
+    case "$1" in
+        doh)
+            [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 --resolve "$D_HOST:$D_PORT:$ip" \
+                -H 'accept: application/dns-message' \
+                "https://$D_HOST:$D_PORT$D_PATH?dns=AAABAAABAAAAAAAAA3d3dwZnb29nbGUDY29tAAABAAE" 2>/dev/null)" = "200" ]
+            ;;
+        dot)
+            dig "@$ip" -p "$D_PORT" "$TEST_DOMAIN" +tls +timeout=3 +tries=1 2>/dev/null | grep -q 'status: NOERROR'
+            ;;
+        *)
+            dig "@$ip" -p "$D_PORT" "$TEST_DOMAIN" +timeout=2 +tries=1 2>/dev/null | grep -q 'status: NOERROR'
+            ;;
+    esac
+}
+
+# A single lost packet must not switch the server
+fo_probe_retry() {
+    local i
+    for i in 1 2 3; do
+        fo_probe "$1" "$2" && return 0
+        [ "$i" -lt 3 ] && sleep 4
+    done
+    return 1
+}
+
+# The server as an entry of the sing-box configuration, under the tag podkop uses
+fo_entry() {
+    fo_parse "$1" "$2"
+    local t="udp" named=""
+    case "$1" in
+        doh) t="https" ;;
+        dot) t="tls" ;;
+    esac
+    is_ip "$D_HOST" || named="1"
+    jq -c -n --arg t "$t" --arg h "$D_HOST" --arg p "$D_PORT" --arg path "$D_PATH" --arg named "$named" \
+        '{type: $t, tag: "dns-server", server: $h, server_port: ($p | tonumber)}
+         + (if $t == "https" then {path: $path} else {} end)
+         + (if $named == "1" then {domain_resolver: "bootstrap-dns-server"} else {} end)'
+}
+
+fo_current() {
+    jq -c -S '.dns.servers[]? | select(.tag == "dns-server")' "$SB_CONFIG" 2>/dev/null
+}
+
+# Replaces the main DNS server of the running sing-box. The configuration is
+# checked by sing-box before it takes the place of the working one
+fo_set_server() {
+    local tmp="$SB_CONFIG.dns-checker"
+    jq --argjson e "$1" '.dns.servers |= map(if .tag == "dns-server" then $e else . end)' "$SB_CONFIG" > "$tmp" 2>/dev/null
+    if [ ! -s "$tmp" ] || ! sing-box check -c "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SB_CONFIG"
+    /etc/init.d/sing-box restart >/dev/null 2>&1
+}
+
+fo_clear() {
+    rm -f "$STATE_DIR/active" "$STATE_DIR/primary_entry" "$STATE_DIR/backup_entry" "$STATE_DIR/ok_count" "$STATE_DIR/hold" \
+        "$STATE_DIR/active_type" "$STATE_DIR/active_server" "$STATE_DIR/tier" "$STATE_DIR/both_down" "$STATE_DIR/backup_ok"
+}
+
+# Remembers one more failure of the primary server and says how many there were in a day
+fo_count_fail() {
+    local now t n=0 keep=""
+    now=$(date +%s)
+    for t in $(cat "$STATE_DIR/fails" 2>/dev/null) "$now"; do
+        if [ "$((now - t))" -lt 86400 ]; then
+            keep="$keep $t"
+            n=$((n + 1))
+        fi
+    done
+    echo "$keep" > "$STATE_DIR/fails"
+    echo "$n"
+}
+
+# The last line of defence: plain UDP servers inside Russia. The bootstrap server
+# goes first. They may lie about blocked names, but podkop answers those itself
+fo_reserve_list() {
+    local s seen=" "
+    for s in $(uci -q get podkop.settings.bootstrap_dns_server) $FO_RESERVE; do
+        is_ip "$s" || continue
+        case "$seen" in
+            *" $s "*) ;;
+            *) seen="$seen$s "; echo "$s" ;;
+        esac
+    done
+}
+
+# Finds a server to work instead of the primary one: the backup server first,
+# then the reserve list. Sets PK_TYPE, PK_SERVER and PK_TIER
+fo_pick() {
+    local s
+    if fo_probe_retry "$FO_TYPE" "$FO_SERVER"; then
+        PK_TYPE="$FO_TYPE"
+        PK_SERVER="$FO_SERVER"
+        PK_TIER="backup"
+        return 0
+    fi
+    for s in $(fo_reserve_list); do
+        if fo_probe udp "$s" || fo_probe udp "$s"; then
+            PK_TYPE="udp"
+            PK_SERVER="$s"
+            PK_TIER="reserve"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Puts the picked server to work. The entry of the primary server is kept from
+# the first switch
+fo_switch() {
+    local entry
+    entry=$(fo_entry "$PK_TYPE" "$PK_SERVER")
+    fo_set_server "$entry" || return 1
+    echo "$entry" > "$STATE_DIR/backup_entry"
+    [ -f "$STATE_DIR/active" ] || date +%s > "$STATE_DIR/active"
+    echo "$PK_TYPE" > "$STATE_DIR/active_type"
+    echo "$PK_SERVER" > "$STATE_DIR/active_server"
+    echo "$PK_TIER" > "$STATE_DIR/tier"
+    echo 0 > "$STATE_DIR/ok_count"
+    rm -f "$STATE_DIR/backup_ok"
+}
+
+fo_return() {
+    if fo_set_server "$(cat "$STATE_DIR/primary_entry")"; then
+        fo_clear
+        fo_log "$1"
+    fi
+}
+
+action_failover_check() {
+    fo_load
+    mkdir -p "$STATE_DIR"
+    date +%s > "$STATE_DIR/last_check"
+
+    # podkop is stopped or is rebuilding its configuration right now
+    pidof sing-box >/dev/null 2>&1 || return 0
+    pgrep -f '/usr/bin/podkop (start|stop|restart|reload)' >/dev/null 2>&1 && return 0
+    local cur
+    cur=$(fo_current)
+    [ -n "$cur" ] || return 0
+
+    local active=0
+    if [ -f "$STATE_DIR/active" ]; then
+        if [ "$cur" = "$(jq -c -S . "$STATE_DIR/backup_entry" 2>/dev/null)" ]; then
+            active=1
+        else
+            # podkop was restarted and wrote its own configuration back
+            fo_clear
+        fi
+    fi
+
+    if [ -z "$FO_SERVER" ]; then
+        [ "$active" -eq 1 ] && fo_return "Резервный DNS отключён, возвращён основной"
+        return 0
+    fi
+
+    local p_type p_server
+    p_type=$(uci -q get podkop.settings.dns_type || echo "udp")
+    p_server=$(uci -q get podkop.settings.dns_server)
+    [ -n "$p_server" ] || return 0
+
+    if [ "$active" -eq 0 ]; then
+        if fo_probe_retry "$p_type" "$p_server"; then
+            echo ok > "$STATE_DIR/primary_state"
+            rm -f "$STATE_DIR/both_down"
+            return 0
+        fi
+        echo fail > "$STATE_DIR/primary_state"
+        if ! fo_pick; then
+            # no answer from any server: the internet is down, switching gives nothing
+            if [ ! -f "$STATE_DIR/both_down" ]; then
+                touch "$STATE_DIR/both_down"
+                fo_log "Основной, резервный и запасные DNS не отвечают, похоже, нет интернета"
+            fi
+            return 0
+        fi
+        rm -f "$STATE_DIR/both_down"
+        echo "$cur" > "$STATE_DIR/primary_entry"
+        if fo_switch; then
+            if [ "$PK_TIER" = "reserve" ]; then
+                fo_count_fail >/dev/null
+                fo_log "Основной DNS $p_server и резервный $FO_SERVER не отвечают, включён запасной $PK_SERVER"
+            elif [ "$(fo_count_fail)" -ge "$FO_HOLD_FAILS" ]; then
+                touch "$STATE_DIR/hold"
+                fo_log "Основной DNS $p_server не отвечает снова, резервный $FO_SERVER включён до ночи"
+            else
+                fo_log "Основной DNS $p_server не отвечает, включён резервный $FO_SERVER"
+            fi
+        else
+            fo_clear
+            fo_log "Основной DNS $p_server не отвечает, но $PK_SERVER включить не удалось"
+        fi
+        return 0
+    fi
+
+    # another server is at work: the primary must answer several checks in a row
+    local a_type a_server tier
+    a_type=$(cat "$STATE_DIR/active_type" 2>/dev/null || echo "$FO_TYPE")
+    a_server=$(cat "$STATE_DIR/active_server" 2>/dev/null || echo "$FO_SERVER")
+    tier=$(cat "$STATE_DIR/tier" 2>/dev/null || echo "backup")
+    if fo_probe "$p_type" "$p_server"; then
+        local n
+        n=$(($(cat "$STATE_DIR/ok_count" 2>/dev/null || echo 0) + 1))
+        echo "$n" > "$STATE_DIR/ok_count"
+        echo ok > "$STATE_DIR/primary_state"
+        if [ "$n" -ge "$FO_RETURN_CHECKS" ]; then
+            if [ ! -f "$STATE_DIR/hold" ] || [ "$tier" = "reserve" ]; then
+                fo_return "Основной DNS $p_server снова отвечает, возвращён"
+            elif [ "$(date +%H)" -eq "$FO_HOLD_HOUR" ]; then
+                fo_return "Основной DNS $p_server отвечает, возвращён ночью"
+            elif ! fo_probe_retry "$a_type" "$a_server"; then
+                # waiting for the night makes no sense when the backup server is the one that is silent
+                fo_return "Резервный DNS $a_server перестал отвечать, возвращён основной $p_server"
+            fi
+        fi
+        return 0
+    fi
+    echo 0 > "$STATE_DIR/ok_count"
+    echo fail > "$STATE_DIR/primary_state"
+
+    # the primary is still silent: the server at work must not fall silent unnoticed
+    if [ "$tier" = "reserve" ]; then
+        # the backup server must answer as long as the primary one does before it is trusted again
+        if fo_probe "$FO_TYPE" "$FO_SERVER"; then
+            local b
+            b=$(($(cat "$STATE_DIR/backup_ok" 2>/dev/null || echo 0) + 1))
+            echo "$b" > "$STATE_DIR/backup_ok"
+            if [ "$b" -ge "$FO_RETURN_CHECKS" ]; then
+                PK_TYPE="$FO_TYPE"
+                PK_SERVER="$FO_SERVER"
+                PK_TIER="backup"
+                fo_switch && fo_log "Резервный DNS $FO_SERVER снова отвечает, включён вместо запасного $a_server"
+                return 0
+            fi
+        else
+            echo 0 > "$STATE_DIR/backup_ok"
+        fi
+    fi
+    if fo_probe_retry "$a_type" "$a_server"; then
+        rm -f "$STATE_DIR/both_down"
+        return 0
+    fi
+    if fo_pick && [ "$PK_SERVER" != "$a_server" ]; then
+        rm -f "$STATE_DIR/hold"
+        if fo_switch; then
+            fo_log "DNS $a_server перестал отвечать, основной $p_server тоже молчит, включён $PK_SERVER"
+        fi
+    elif [ ! -f "$STATE_DIR/both_down" ]; then
+        touch "$STATE_DIR/both_down"
+        fo_log "Ни один DNS не отвечает, похоже, нет интернета"
+    fi
+    return 0
+}
+
+action_failover_daemon() {
+    while :; do
+        action_failover_check
+        sleep "$FO_INTERVAL"
+    done
+}
+
+# Starts the service while a backup server is set and removes it otherwise
+fo_setup() {
+    fo_load
+    if [ -n "$FO_SERVER" ]; then
+        if ! grep -q "^$FO_INIT_MARK\$" "$FO_INIT" 2>/dev/null; then
+            cat << 'EOF' > "$FO_INIT"
+#!/bin/sh /etc/rc.common
+# dns-checker failover service 1
+
+START=99
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/dns-checker-engine failover_daemon
+    procd_set_param respawn 3600 5 0
+    procd_close_instance
+}
+EOF
+            chmod 755 "$FO_INIT"
+            "$FO_INIT" enable
+            "$FO_INIT" restart
+            return 0
+        fi
+        "$FO_INIT" enabled || "$FO_INIT" enable
+        if [ "$1" = "restart" ]; then
+            "$FO_INIT" restart
+        elif ! "$FO_INIT" running; then
+            "$FO_INIT" start
+        fi
+    elif [ -f "$FO_INIT" ]; then
+        "$FO_INIT" stop
+        "$FO_INIT" disable
+        rm -f "$FO_INIT"
+        action_failover_check
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply Primary Podkop DNS
+# ------------------------------------------------------------------------------
+action_apply_primary() {
+    local proto="$1"
+    local addr="$2"
+    local boot="$3"
+    [ -z "$proto" ] && proto="udp"
+    [ -z "$boot" ] && boot="195.208.5.1"
+
+    uci set podkop.settings.dns_type="$proto"
+    uci set podkop.settings.dns_server="$addr"
+    uci set podkop.settings.bootstrap_dns_server="$boot"
+    uci commit podkop
+
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    echo '{"status": "ok", "message": "Основной DNS Podkop успешно применен."}'
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply Backup Podkop DNS (podkop is not restarted)
+# ------------------------------------------------------------------------------
+action_apply_backup() {
+    fo_load
+    fo_save "$1" "$2"
+    fo_setup >/dev/null 2>&1
+    echo '{"status": "ok", "message": "Резервный DNS Podkop успешно применен."}'
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply Dual Router WAN DNS
+# ------------------------------------------------------------------------------
+action_apply_wan() {
+    local wan1="$1"
+    local wan2="$2"
+
+    uci -q del network.wan.dns
+    if [ -n "$wan1" ] && [ "$wan1" != "auto" ] && [ "$wan1" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan1"
+    fi
+    if [ -n "$wan2" ] && [ "$wan2" != "auto" ] && [ "$wan2" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan2"
+    fi
+    uci commit network
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    echo '{"status": "ok", "message": "DNS роутера (WAN) успешно применен."}'
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply All Settings (Consolidated)
+# ------------------------------------------------------------------------------
+action_apply() {
+    local proto1="$1"
+    local primary="$2"
+    local boot="$3"
+    local proto2="$4"
+    local backup="$5"
+    local wan1="$6"
+    local wan2="$7"
+
+    [ -z "$proto1" ] && proto1="udp"
+    [ -z "$boot" ] && boot="195.208.5.1"
+    [ -z "$proto2" ] && proto2="udp"
+
+    # Snapshot config
+    tar -czf "$BACKUP_DIR/pre_apply_backup.tar.gz" \
+        /etc/config/podkop \
+        /etc/config/network \
+        /etc/config/dhcp \
+        /etc/config/dns-checker 2>/dev/null
+
+    # 1. Podkop Primary
+    uci set podkop.settings.dns_type="$proto1"
+    uci set podkop.settings.dns_server="$primary"
+    uci set podkop.settings.bootstrap_dns_server="$boot"
+
+    # 2. Podkop Backup
+    uci commit podkop
+    fo_load
+    fo_save "$proto2" "$backup"
+
+    # 3. Router WAN Dual DNS
+    uci -q del network.wan.dns
+    if [ -n "$wan1" ] && [ "$wan1" != "auto" ] && [ "$wan1" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan1"
+    fi
+    if [ -n "$wan2" ] && [ "$wan2" != "auto" ] && [ "$wan2" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan2"
+    fi
+    uci commit network
+
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    sleep 2
+    fo_setup >/dev/null 2>&1
+
+    if nslookup "$TEST_DOMAIN" 127.0.0.1 >/dev/null 2>&1 || ping -c 1 -W 2 "195.208.5.1" >/dev/null 2>&1; then
+        echo '{"status": "ok", "message": "Все настройки DNS успешно применены и проверены."}'
+    else
+        restore_configs "$BACKUP_DIR/pre_apply_backup.tar.gz"
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        /etc/init.d/podkop restart >/dev/null 2>&1
+        fo_setup >/dev/null 2>&1
+        echo '{"status": "error", "message": "Сбой проверки сети. Автоматический откат назад."}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Entrypoint Router
+# ------------------------------------------------------------------------------
+case "$1" in
+    test)
+        action_test
+        ;;
+    test_start)
+        action_test_start
+        ;;
+    test_result)
+        action_test_result
+        ;;
+    status)
+        action_status
+        ;;
+    leak_test)
+        action_leak_test
+        ;;
+    check_update)
+        action_check_update
+        ;;
+    add_custom)
+        action_add_custom "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    del_custom)
+        action_del_custom "$2"
+        ;;
+    backup)
+        action_backup
+        ;;
+    restore)
+        action_restore
+        ;;
+    update)
+        action_update
+        ;;
+    apply_primary)
+        action_apply_primary "$2" "$3" "$4"
+        ;;
+    apply_backup)
+        action_apply_backup "$2" "$3"
+        ;;
+    apply_wan)
+        action_apply_wan "$2" "$3"
+        ;;
+    apply)
+        action_apply "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        ;;
+    failover_check)
+        action_failover_check
+        ;;
+    failover_daemon)
+        action_failover_daemon
+        ;;
+    failover_setup)
+        fo_setup "$2"
+        ;;
+    *)
+        echo "Usage: $0 {test|test_start|test_result|status|leak_test|check_update|add_custom|del_custom|backup|restore|update|apply_primary|apply_backup|apply_wan|apply|failover_check|failover_setup}"
+        exit 1
+        ;;
+esac
