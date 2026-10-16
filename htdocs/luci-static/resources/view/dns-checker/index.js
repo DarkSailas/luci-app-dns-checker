@@ -6,10 +6,10 @@
 
 var ENGINE = '/usr/bin/dns-checker-engine';
 // fallback for the page header; the engine reports the installed version in "status"
-var VIEW_VERSION = '1.3.0';
+var VIEW_VERSION = '1.3.1';
 
 // These servers are recommended as the primary one only when no other one answers
-var LOW_PRIORITY = { yandex: true, nextdns: true };
+var LOW_PRIORITY = { yandex: true, nextdns: true, xboxdns: true };
 // The backup server has to stay reachable, so this one goes first when it answers
 var BACKUP_FIRST = 'nextdns';
 
@@ -775,7 +775,7 @@ return view.extend({
 			return self.section('bench', 'Замер задержек', [
 				E('div', { 'class': 'dc-bar' }, [
 					E('span', { 'class': 'dc-hint', 'style': 'flex:1 1 20em' },
-						'Каждому серверу отправляется 10 запросов по UDP, DoH и DoT, в таблице — средняя задержка. Заодно проверяется, не перехватывает ли провайдер запросы по UDP. Замер идёт до минуты. Основным Yandex DNS и NextDNS рекомендуются, только если остальные серверы не отвечают. Резервным рекомендуется NextDNS: от резерва нужна прежде всего доступность.'),
+						'Каждому серверу отправляется 10 запросов по UDP, DoH и DoT, в таблице — средняя задержка. Заодно проверяется, не перехватывает ли провайдер запросы по UDP. Замер идёт до минуты. Основным Yandex DNS, XboxDNS и NextDNS рекомендуются, только если остальные серверы не отвечают. Резервным рекомендуется NextDNS: от резерва нужна прежде всего доступность.'),
 					btn(state.benchmark ? 'Повторить замер' : 'Запустить замер', 'cbi-button-action', actions.runBenchmark)
 				]),
 				r ? E('div', { 'class': 'dc-upd dc-upd-new' }, [
@@ -851,9 +851,9 @@ return view.extend({
 
 			return self.section('auto', 'Автоподбор DNS', [
 				E('p', { 'class': 'dc-hint' },
-					'Раз в сутки роутер сам замеряет DoH-серверы: по 64 запроса каждому на одном соединении, как работает sing-box, и проверяет, что youtube.com не подменён. Yandex DNS не выбирается.'),
+					'Раз в сутки роутер сам замеряет DoH-серверы: по 64 запроса каждому на одном соединении, как работает sing-box, и проверяет, что youtube.com не подменён. Yandex DNS и XboxDNS не выбираются: XboxDNS время от времени блокируют.'),
 				E('p', { 'class': 'dc-hint' },
-					'Основной DNS меняется, только если он не отвечает, работает не через DoH или вдвое медленнее лучшего и хотя бы на 15 мс. Если причина в скорости, новый сервер должен оказаться лучшим два дня подряд: каждая смена перезапускает Podkop, связь пропадает секунд на 20. Если после смены DNS не заработал, возвращается прежний. ' +
+					'Основной DNS меняется, только если он не отвечает, работает не через DoH, это Yandex DNS или XboxDNS, или он вдвое медленнее лучшего и хотя бы на 15 мс. Если причина в скорости, новый сервер должен оказаться лучшим два дня подряд: каждая смена перезапускает Podkop, связь пропадает секунд на 20. Если после смены DNS не заработал, возвращается прежний. ' +
 					'Резервный берётся от другого сервиса, чем основной, первым — NextDNS; меняется, если не отвечает или медленнее 80 мс. Пока вместо основного работает резервный, подбор пропускается.'),
 				E('div', { 'class': 'dc-bar' }, [
 					E('label', { 'class': 'dc-check' }, [ on, 'Каждый день в' ]),

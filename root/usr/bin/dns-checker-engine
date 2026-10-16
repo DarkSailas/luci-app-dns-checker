@@ -2,10 +2,10 @@
 # ==============================================================================
 # DNS Checker Engine for OpenWrt
 # High-performance DNS benchmarking, health check and configuration applicator
-# Version: 1.3.0
+# Version: 1.3.1
 # ==============================================================================
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 REPO_BASE="https://raw.githubusercontent.com/DarkSailas/luci-app-dns-checker/main"
 BACKUP_DIR="/etc/dns-checker"
 CONFIG_FILE="/etc/config/dns-checker"
@@ -1062,8 +1062,9 @@ quad9|Quad9|https://dns.quad9.net/dns-query|45.90.28.80|quad9
 dnssb|DNS.SB|https://doh.dns.sb/dns-query|45.90.28.80|dnssb
 he|Hurricane Electric|https://ordns.he.net/dns-query|45.90.28.80|he
 xboxdns|XboxDNS|https://xbox-dns.ru/dns-query|195.208.5.1|xboxdns"
-# Never picked, ids separated by "|" (Yandex DNS: decided by the owner of the router)
-AP_EXCLUDE="yandex"
+# Never picked, ids separated by "|". Decided by the owner of the router: Yandex DNS is bad
+# for data-centre addresses, XboxDNS gets blocked from time to time
+AP_EXCLUDE="yandex|xboxdns"
 # NextDNS becomes the primary server only when no other one is good
 AP_LOW="nextdns"
 # A server is good when it answers this share of the queries, in percent
