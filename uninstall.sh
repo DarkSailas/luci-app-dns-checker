@@ -35,6 +35,11 @@ if [ -f /etc/init.d/dns-checker ]; then
     rm -f /etc/init.d/dns-checker
 fi
 rm -rf /tmp/dns-checker
+# daily DNS autopick
+if grep -q '# dns-checker autopick' /etc/crontabs/root 2>/dev/null; then
+    sed -i '/# dns-checker autopick/d' /etc/crontabs/root
+    /etc/init.d/cron restart >/dev/null 2>&1 || true
+fi
 
 if [ "$RESTORE_CONFIG" -eq 1 ] && [ -f "$BACKUP_DIR/initial_backup.tar.gz" ]; then
     echo ">>> Restoring original network and podkop configuration..."

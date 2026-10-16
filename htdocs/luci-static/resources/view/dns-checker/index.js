@@ -6,7 +6,7 @@
 
 var ENGINE = '/usr/bin/dns-checker-engine';
 // fallback for the page header; the engine reports the installed version in "status"
-var VIEW_VERSION = '1.2.7';
+var VIEW_VERSION = '1.3.0';
 
 // These servers are recommended as the primary one only when no other one answers
 var LOW_PRIORITY = { yandex: true, nextdns: true };
@@ -14,7 +14,7 @@ var LOW_PRIORITY = { yandex: true, nextdns: true };
 var BACKUP_FIRST = 'nextdns';
 
 var OPEN_KEY = 'dnschecker.sections';
-var OPEN_DEFAULT = { 'bench': true, 'config': true, 'custom': false };
+var OPEN_DEFAULT = { 'bench': true, 'config': true, 'auto': true, 'custom': false };
 // 100% on the page is the theme size times ZOOM_BASE
 var ZOOM_KEY = 'dnschecker.scale';
 var ZOOM_BASE = 1.25;
@@ -131,6 +131,8 @@ var CSS = [
 	'  outline:none; transition:border-color .15s ease, background-color .15s ease; }',
 	'.dc-page input[type="text"]:focus { border-color:#8ef5b5 !important; background:rgba(142,245,181,.06) !important; }',
 	'.dc-page input[type="text"]::placeholder { color:inherit; opacity:.45; }',
+	'.dc-page input.dc-time { flex:0 0 5.5em; width:5.5em; text-align:center; font-variant-numeric:tabular-nums; }',
+	'.dc-check { display:inline-flex; align-items:center; gap:.4em; font-size:12px; cursor:pointer; }',
 	// colours of a select stay with the theme: the drop-down list is drawn by the browser
 	'.dc-page select { box-sizing:border-box; width:100% !important; min-width:0 !important; height:26px !important; min-height:0 !important; margin:0 !important;',
 	'  padding:0 .5em !important; font-size:12px !important; line-height:24px !important; box-shadow:none !important;',
@@ -339,6 +341,7 @@ return view.extend({
 			activeBackupServer: '',
 			activeBackupProto: 'udp',
 			failover: {},
+			autopick: {},
 			activeWanDns: '',
 			customProviders: [],
 			providersList: [],
@@ -399,6 +402,7 @@ return view.extend({
 			state.activeBackupServer = (st.podkop && st.podkop.backup_dns_server) || '';
 			state.activeBackupProto = (st.podkop && st.podkop.backup_dns_type) || 'udp';
 			state.failover = st.failover || {};
+			state.autopick = st.autopick || {};
 			state.activeWanDns = st.router_wan_dns || '';
 			state.customProviders = st.custom_providers || [];
 			rebuildProvidersList();
@@ -611,6 +615,41 @@ return view.extend({
 				});
 			},
 
+			saveAutopick: function(enabled, time) {
+				if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(time))
+					return notify('Время укажите как ЧЧ:ММ, например 05:30', true);
+				return apply([ 'autopick_set', enabled ? '1' : '0', time ],
+					enabled ? 'Автоподбор включён, запуск каждый день в ' + time : 'Автоподбор выключен');
+			},
+
+			// a run takes up to a couple of minutes, longer than a LuCI call may wait,
+			// so it starts in the background and the page asks for the status
+			runAutopick: function() {
+				var deadline = Date.now() + 180000;
+				var wait = function() {
+					return new Promise(function(resolve) {
+						window.setTimeout(resolve, 3000);
+					}).then(function() {
+						// a single lost answer on a busy router is not a failure
+						return engine([ 'status' ]).catch(function() { return null; });
+					}).then(function(st) {
+						if (!st || !st.autopick || st.autopick.running) {
+							if (Date.now() > deadline)
+								throw new Error('роутер не ответил за три минуты');
+							return wait();
+						}
+						takeStatus(st);
+						render();
+						var last = (st.autopick.log || []).slice(-1)[0];
+						if (last)
+							notify(last.text, last.kind === 'error');
+					});
+				};
+				return engine([ 'autopick_start' ]).then(wait).catch(function(e) {
+					notify('Автоподбор не удался: ' + e.message, true);
+				});
+			},
+
 			deleteCustom: function(id, name) {
 				if (!confirm('Удалить профиль ' + name + '?'))
 					return;
@@ -736,7 +775,7 @@ return view.extend({
 			return self.section('bench', 'Замер задержек', [
 				E('div', { 'class': 'dc-bar' }, [
 					E('span', { 'class': 'dc-hint', 'style': 'flex:1 1 20em' },
-						'Каждому серверу отправляется 10 запросов по UDP, DoH и DoT, в таблице — средняя задержка. Заодно проверяется, не перехватывает ли провайдер запросы по UDP. Замер идёт до минуты. Основным Yandex DNS и NextDNS рекомендуются, только если остальные серверы не отвечают. Резервным рекомендуется Yandex DNS: от резерва нужна прежде всего доступность.'),
+						'Каждому серверу отправляется 10 запросов по UDP, DoH и DoT, в таблице — средняя задержка. Заодно проверяется, не перехватывает ли провайдер запросы по UDP. Замер идёт до минуты. Основным Yandex DNS и NextDNS рекомендуются, только если остальные серверы не отвечают. Резервным рекомендуется NextDNS: от резерва нужна прежде всего доступность.'),
 					btn(state.benchmark ? 'Повторить замер' : 'Запустить замер', 'cbi-button-action', actions.runBenchmark)
 				]),
 				r ? E('div', { 'class': 'dc-upd dc-upd-new' }, [
@@ -791,6 +830,45 @@ return view.extend({
 			]);
 		}
 
+		var AP_KIND = {
+			keep: [ 'без изменений', 'ok' ],
+			pending: [ 'ждёт завтра', 'warn' ],
+			'switch': [ 'заменён', 'warn' ],
+			skip: [ 'пропущен', '' ],
+			error: [ 'ошибка', 'bad' ]
+		};
+
+		function autoSection() {
+			var ap = state.autopick;
+			var on = E('input', { 'type': 'checkbox' });
+			on.checked = !!ap.enabled;
+			var time = E('input', { 'class': 'cbi-input-text dc-time', 'type': 'text', 'value': ap.time || '05:30', 'placeholder': '05:30', 'maxlength': '5' });
+
+			var rows = (ap.log || []).slice().reverse().map(function(l) {
+				var k = AP_KIND[l.kind] || [ l.kind, '' ];
+				return [ E('span', { 'class': 'dc-num' }, fmtTime(l.time)), pill(k[0], k[1]), l.text ];
+			});
+
+			return self.section('auto', 'Автоподбор DNS', [
+				E('p', { 'class': 'dc-hint' },
+					'Раз в сутки роутер сам замеряет DoH-серверы: по 64 запроса каждому на одном соединении, как работает sing-box, и проверяет, что youtube.com не подменён. Yandex DNS не выбирается.'),
+				E('p', { 'class': 'dc-hint' },
+					'Основной DNS меняется, только если он не отвечает, работает не через DoH или вдвое медленнее лучшего и хотя бы на 15 мс. Если причина в скорости, новый сервер должен оказаться лучшим два дня подряд: каждая смена перезапускает Podkop, связь пропадает секунд на 20. Если после смены DNS не заработал, возвращается прежний. ' +
+					'Резервный берётся от другого сервиса, чем основной, первым — NextDNS; меняется, если не отвечает или медленнее 80 мс. Пока вместо основного работает резервный, подбор пропускается.'),
+				E('div', { 'class': 'dc-bar' }, [
+					E('label', { 'class': 'dc-check' }, [ on, 'Каждый день в' ]),
+					time,
+					btn('Сохранить', 'cbi-button-neutral', function() {
+						return actions.saveAutopick(on.checked, time.value.trim());
+					}),
+					btn('Подобрать сейчас', 'cbi-button-action', actions.runAutopick),
+					ap.running ? pill('идёт подбор', 'warn') : '',
+					ap.pending ? pill('завтра проверим ' + ap.pending, 'warn', 'Этот сервер оказался заметно лучше основного. Если завтра он снова будет лучшим, Podkop перейдёт на него') : ''
+				]),
+				table([ 'Время', 'Итог', 'Подробности' ], rows, 'Подбор ещё не запускался', [ '12%', '14%', '74%' ])
+			], ap.enabled ? 'каждый день в ' + (ap.time || '05:30') : 'выключен');
+		}
+
 		function customSection() {
 			var input = function(placeholder) {
 				return E('input', { 'class': 'cbi-input-text', 'type': 'text', 'placeholder': placeholder });
@@ -830,7 +908,7 @@ return view.extend({
 		var root = E('div', {});
 
 		function render() {
-			dom.content(root, [ updateBar(), summary(), benchSection(), configSection(), customSection() ]);
+			dom.content(root, [ updateBar(), summary(), benchSection(), configSection(), autoSection(), customSection() ]);
 		}
 
 		takeStatus(initialStatus);

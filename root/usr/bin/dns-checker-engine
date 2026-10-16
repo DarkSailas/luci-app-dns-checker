@@ -2,10 +2,10 @@
 # ==============================================================================
 # DNS Checker Engine for OpenWrt
 # High-performance DNS benchmarking, health check and configuration applicator
-# Version: 1.2.7
+# Version: 1.3.0
 # ==============================================================================
 
-VERSION="1.2.7"
+VERSION="1.3.0"
 REPO_BASE="https://raw.githubusercontent.com/DarkSailas/luci-app-dns-checker/main"
 BACKUP_DIR="/etc/dns-checker"
 CONFIG_FILE="/etc/config/dns-checker"
@@ -518,6 +518,14 @@ action_status() {
         fo_ev=$(cut -d' ' -f2- "$STATE_DIR/last_event" | tr -d '"\\\r\n')
     fi
 
+    local ap_en ap_time ap_run="false" ap_pend="" ap_log_json=""
+    ap_en=$(uci -q get dns-checker.autopick.enabled || echo 0)
+    ap_time=$(uci -q get dns-checker.autopick.time || echo "$AP_TIME_DEFAULT")
+    ap_running && ap_run="true"
+    [ -f "$AP_PENDING" ] && ap_pend=$(cut -d'|' -f2 "$AP_PENDING" | tr -d '"\\\r\n')
+    [ -f "$AP_LOG" ] && ap_log_json=$(tail -n 10 "$AP_LOG" | awk -F'|' '
+        NF >= 3 { printf "%s{\"time\":%d,\"kind\":\"%s\",\"text\":\"%s\"}", (n++ ? "," : ""), $1, $2, $3 }')
+
     cat << EOF
 {
   "version": "$VERSION",
@@ -544,6 +552,13 @@ action_status() {
     "interval": $FO_INTERVAL,
     "event_time": ${fo_ev_time:-0},
     "event": "$fo_ev"
+  },
+  "autopick": {
+    "enabled": $([ "$ap_en" = "1" ] && echo true || echo false),
+    "time": "$ap_time",
+    "running": $ap_run,
+    "pending": "$ap_pend",
+    "log": [$ap_log_json]
   },
   "router_wan_dns": "$wan_dns",
   "custom_providers": [$custom_json],
@@ -1025,6 +1040,379 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+# Autopick: once a day the DoH servers are measured and podkop is moved to a
+# server that is clearly better. Every change of the primary server restarts
+# podkop and breaks the open connections, so the bar is set high
+# ------------------------------------------------------------------------------
+AP_LOG="$BACKUP_DIR/autopick.log"
+AP_PENDING="$BACKUP_DIR/autopick.pending"
+AP_PID="$STATE_DIR/autopick.pid"
+AP_MARK="# dns-checker autopick"
+AP_TIME_DEFAULT="05:30"
+# Only DoH is picked: plain UDP may be replaced on the way, and sing-box 1.13 reuses
+# DoT connections the server has already closed ("read response: EOF").
+# id|name|address|bootstrap|family; servers of one family do not back up each other
+AP_PROVIDERS="comss|COMSS One|https://dns.comss.one/dns-query|195.208.5.1|comss
+comss2|COMSS Router|https://router.comss.one/dns-query|195.208.5.1|comss
+nextdns|NextDNS|https://dns.nextdns.io/dns-query|185.222.222.222|nextdns
+adguard|AdGuard DNS|https://dns.adguard-dns.com/dns-query|45.90.28.80|adguard
+cloudflare|Cloudflare|https://cloudflare-dns.com/dns-query|45.90.28.80|cloudflare
+google|Google Public|https://dns.google/dns-query|45.90.28.80|google
+quad9|Quad9|https://dns.quad9.net/dns-query|45.90.28.80|quad9
+dnssb|DNS.SB|https://doh.dns.sb/dns-query|45.90.28.80|dnssb
+he|Hurricane Electric|https://ordns.he.net/dns-query|45.90.28.80|he
+xboxdns|XboxDNS|https://xbox-dns.ru/dns-query|195.208.5.1|xboxdns"
+# Never picked, ids separated by "|" (Yandex DNS: decided by the owner of the router)
+AP_EXCLUDE="yandex"
+# NextDNS becomes the primary server only when no other one is good
+AP_LOW="nextdns"
+# A server is good when it answers this share of the queries, in percent
+AP_MIN_OK=95
+# The primary server is changed only when its score is this many times worse than
+# the best one and at least this many milliseconds worse
+AP_RATIO=2
+AP_MIN_GAIN=15
+# The backup server: this one goes first, and a backup server is changed for speed
+# only when its score is above this many milliseconds
+AP_BACKUP_FIRST="nextdns"
+AP_BACKUP_MAX=80
+# Queries of the measurement: google.com, ya.ru, github.com, wikipedia.org, vk.com,
+# microsoft.com, apple.com, mail.ru (type A, DNS wire format in base64url)
+AP_QUERIES="AAABAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ AAABAAABAAAAAAAAAnlhAnJ1AAABAAE AAABAAABAAAAAAAABmdpdGh1YgNjb20AAAEAAQ AAABAAABAAAAAAAACXdpa2lwZWRpYQNvcmcAAAEAAQ AAABAAABAAAAAAAAAnZrA2NvbQAAAQAB AAABAAABAAAAAAAACW1pY3Jvc29mdANjb20AAAEAAQ AAABAAABAAAAAAAABWFwcGxlA2NvbQAAAQAB AAABAAABAAAAAAAABG1haWwCcnUAAAEAAQ"
+AP_YOUTUBE="AAABAAABAAAAAAAAB3lvdXR1YmUDY29tAAABAAE"
+
+ap_running() {
+    local pid
+    pid=$(cat "$AP_PID" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+ap_log() {
+    logger -t dns-checker "Автоподбор: $2"
+    if [ -n "$AP_DRY" ]; then
+        echo "$1: $2"
+        return 0
+    fi
+    echo "$(date +%s)|$1|$(echo "$2" | tr -d '|"\\\r\n')" >> "$AP_LOG"
+    tail -n 30 "$AP_LOG" > "$AP_LOG.tmp" && mv -f "$AP_LOG.tmp" "$AP_LOG"
+}
+
+# Measures one DoH server the way sing-box uses it: four rounds of 16 queries,
+# each round on one kept connection. Writes "total answered median p90 honest" to $3.
+# The first query of a round also sets up the connection, so its time is not counted
+ap_measure() {
+    local url="$1" boot="$2" out="$3" ip q args r
+    fo_parse doh "$url"
+    ip="$D_HOST"
+    if ! is_ip "$ip"; then
+        ip=$(dig "@$boot" "$D_HOST" A +short +timeout=2 +tries=1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+    fi
+    if [ -z "$ip" ]; then
+        echo "0 0 -1 -1 no" > "$out"
+        return 0
+    fi
+    for r in 1 2 3 4; do
+        args=""
+        for q in $AP_QUERIES $AP_QUERIES; do
+            args="$args -o /dev/null https://$D_HOST:$D_PORT$D_PATH?dns=$q"
+        done
+        curl -s --max-time 2 --connect-timeout 4 --resolve "$D_HOST:$D_PORT:$ip" -H 'accept: application/dns-message' \
+            -w '%{http_code} %{num_connects} %{time_total}\n' $args 2>/dev/null
+        [ "$r" -lt 4 ] && sleep 2
+    done > "$out.raw"
+
+    # an honest server gives youtube.com a public address: the last record of the
+    # answer is of type A and does not point to a stub
+    curl -s --max-time 3 --resolve "$D_HOST:$D_PORT:$ip" -H 'accept: application/dns-message' \
+        -o "$out.yt" "https://$D_HOST:$D_PORT$D_PATH?dns=$AP_YOUTUBE" 2>/dev/null
+    local honest
+    honest=$(hexdump -ve '1/1 "%u "' "$out.yt" 2>/dev/null | awk '{
+        n = NF
+        if (n < 30 || $4 % 16 != 0 || $7 * 256 + $8 == 0) { print "no"; exit }
+        if ($(n-13) != 0 || $(n-12) != 1 || $(n-5) != 0 || $(n-4) != 4) { print "no"; exit }
+        a = $(n-3); b = $(n-2)
+        if (a == 0 || a == 127 || a == 10 || (a == 192 && b == 168) || (a == 198 && (b == 18 || b == 19))) { print "no"; exit }
+        print "yes" }')
+    [ -n "$honest" ] || honest="no"
+
+    local total ok
+    total=$(wc -l < "$out.raw")
+    ok=$(grep -c '^200 ' "$out.raw")
+    awk '$1 == 200 && $2 == 0 { print int($3 * 1000) }' "$out.raw" | sort -n | \
+        awk -v t="$total" -v ok="$ok" -v h="$honest" '
+            { v[NR] = $1 }
+            END {
+                if (NR == 0) { print t, ok, -1, -1, h; exit }
+                p = int(NR * 0.9 + 0.5); if (p < 1) p = 1
+                print t, ok, v[int((NR + 1) / 2)], v[p], h
+            }' > "$out"
+    rm -f "$out.raw" "$out.yt"
+}
+
+# The servers to measure: the built-in ones, own servers with a DoH address, and the
+# servers podkop uses now when they are not in the list
+ap_list() {
+    local s doh name boot
+    echo "$AP_PROVIDERS"
+    for s in $(uci -q show dns-checker | grep '=custom_dns' | cut -d'.' -f2 | cut -d'=' -f1); do
+        doh=$(uci -q get "dns-checker.$s.doh")
+        [ -n "$doh" ] || continue
+        name=$(uci -q get "dns-checker.$s.name" | tr -d '|"\\\r\n')
+        boot=$(uci -q get "dns-checker.$s.boot" || echo "195.208.5.1")
+        echo "$s|${name:-$s}|$doh|$boot|$s"
+    done
+    for s in "$1" "$2"; do
+        case "$s" in
+            https://*)
+                fo_parse doh "$s"
+                echo "cur_$D_HOST|$D_HOST|$s|$(uci -q get podkop.settings.bootstrap_dns_server || echo 195.208.5.1)|$D_HOST"
+                ;;
+        esac
+    done
+}
+
+# Moves podkop to another primary server and checks that names resolve. Without an
+# answer in 30 s the previous server is put back
+ap_set_primary() {
+    local o_type o_server o_boot i
+    o_type=$(uci -q get podkop.settings.dns_type)
+    o_server=$(uci -q get podkop.settings.dns_server)
+    o_boot=$(uci -q get podkop.settings.bootstrap_dns_server)
+    uci set podkop.settings.dns_type="doh"
+    uci set podkop.settings.dns_server="$1"
+    uci set podkop.settings.bootstrap_dns_server="$2"
+    uci commit podkop
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 3
+        nslookup "$TEST_DOMAIN" 127.0.0.1 >/dev/null 2>&1 && break
+    done
+    if [ "$i" -eq 10 ] && ! nslookup "$TEST_DOMAIN" 127.0.0.1 >/dev/null 2>&1; then
+        uci set podkop.settings.dns_type="$o_type"
+        uci set podkop.settings.dns_server="$o_server"
+        uci set podkop.settings.bootstrap_dns_server="$o_boot"
+        uci commit podkop
+        /etc/init.d/podkop restart >/dev/null 2>&1
+        return 1
+    fi
+    # failures of the previous server must not keep the new one on hold
+    rm -f "$STATE_DIR/fails"
+    return 0
+}
+
+action_autopick() {
+    mkdir -p "$STATE_DIR"
+    [ "$1" = "dry" ] && AP_DRY=1
+    if ap_running; then
+        echo "Автоподбор уже идёт"
+        return 0
+    fi
+    echo $$ > "$AP_PID"
+    ap_run
+    rm -f "$AP_PID"
+}
+
+ap_run() {
+    if ! pidof sing-box >/dev/null 2>&1; then
+        ap_log skip "Podkop не запущен, подбор пропущен"
+        return 0
+    fi
+    if [ -f "$STATE_DIR/active" ]; then
+        ap_log skip "Вместо основного DNS сейчас работает резервный, подбор пропущен"
+        return 0
+    fi
+
+    local p_type p_server dir
+    p_type=$(uci -q get podkop.settings.dns_type || echo "udp")
+    p_server=$(uci -q get podkop.settings.dns_server)
+    fo_load
+    dir=$(mktemp -d /tmp/dns-autopick.XXXXXX)
+
+    ap_list "$p_server" "$FO_SERVER" | awk -F'|' 'NF == 5 && !seen[$3]++' | grep -v -E "^($AP_EXCLUDE)\|" > "$dir/list"
+    local id name url boot fam
+    while IFS='|' read -r id name url boot fam; do
+        ap_measure "$url" "$boot" "$dir/$id.m" &
+    done < "$dir/list"
+    wait
+
+    # good|score|low|id|name|url|boot|fam|median|answered
+    local t ok med p90 hon good score low pct
+    while IFS='|' read -r id name url boot fam; do
+        t=0; ok=0; med=-1; p90=-1; hon=no
+        [ -s "$dir/$id.m" ] && read -r t ok med p90 hon < "$dir/$id.m"
+        pct=0
+        [ "$t" -gt 0 ] && pct=$((ok * 100 / t))
+        good=0
+        if [ "$hon" = "yes" ] && [ "$med" -ge 0 ] && [ "$t" -gt 0 ] && [ $((ok * 100)) -ge $((t * AP_MIN_OK)) ]; then
+            good=1
+        fi
+        score=99999
+        [ "$med" -ge 0 ] && score=$(((3 * med + p90) / 4))
+        low=0
+        case " $AP_LOW " in *" $id "*) low=1 ;; esac
+        echo "$good|$score|$low|$id|$name|$url|$boot|$fam|$med|$pct"
+    done < "$dir/list" > "$dir/res"
+
+    local top
+    top=$(grep '^1|' "$dir/res" | sort -t'|' -k2,2n | head -n 3 | awk -F'|' '{ printf "%s%s %s мс", (NR > 1 ? ", " : ""), $5, $2 }')
+    if [ -z "$top" ]; then
+        rm -rf "$dir"
+        ap_log error "Ни один DoH-сервер не прошёл проверку, настройки не тронуты"
+        return 0
+    fi
+
+    # the best primary server; NextDNS only when nothing else is good
+    local best b_score b_name b_url b_boot b_fam
+    best=$(grep '^1|' "$dir/res" | sort -t'|' -k3,3n -k2,2n | head -n 1)
+    IFS='|' read -r good b_score low id b_name b_url b_boot b_fam med ok << EOF
+$best
+EOF
+    local b_id="$id"
+
+    # the primary server at work now
+    local cur c_good=0 c_score=99999 c_ok=0 c_fam="" reason="" urgent=0
+    cur=$(awk -F'|' -v u="$p_server" '$6 == u' "$dir/res" | head -n 1)
+    if [ -n "$cur" ]; then
+        IFS='|' read -r c_good c_score low id name url boot c_fam med c_ok << EOF
+$cur
+EOF
+    fi
+    if [ "$p_type" != "doh" ]; then
+        reason="основной DNS работает не через DoH"
+        urgent=1
+    elif [ -z "$cur" ]; then
+        reason="основной DNS $p_server исключён из подбора"
+        urgent=1
+    elif [ "$c_ok" -lt 50 ]; then
+        reason="основной DNS $p_server почти не отвечает"
+        urgent=1
+    elif [ "$p_server" = "$b_url" ]; then
+        reason=""
+    elif [ "$c_good" -ne 1 ]; then
+        reason="основной DNS $p_server отвечает не на все запросы ($c_ok%)"
+    elif [ "$c_score" -gt $((b_score * AP_RATIO)) ] && [ $((c_score - b_score)) -ge "$AP_MIN_GAIN" ]; then
+        reason="основной DNS $p_server: $c_score мс против $b_score мс у $b_name"
+    fi
+
+    # One line goes to the log at the end: kind (keep, pending, switch, error) and text
+    local p_fam="$c_fam" today kind="keep" msg="" became="стал"
+    [ -n "$AP_DRY" ] && became="стал бы"
+    today=$(date +%Y-%m-%d)
+    if [ -z "$reason" ]; then
+        [ -n "$AP_DRY" ] || rm -f "$AP_PENDING"
+    elif [ "$urgent" -eq 0 ] && [ "$(cut -d"|" -f1 "$AP_PENDING" 2>/dev/null)" != "$b_id" ]; then
+        # a better server has to win two days in a row before podkop is restarted for it
+        [ -n "$AP_DRY" ] || echo "$b_id|$b_name|$today" > "$AP_PENDING"
+        kind="pending"
+        msg="Повод сменить основной: $reason. Если завтра $b_name снова окажется лучше, он станет основным."
+    elif [ "$urgent" -eq 0 ] && [ "$(cut -d"|" -f3 "$AP_PENDING" 2>/dev/null)" = "$today" ]; then
+        kind="pending"
+        msg="$b_name уже отмечен сегодня, смена основного не раньше завтрашнего подбора."
+    elif [ -n "$AP_DRY" ] || ap_set_primary "$b_url" "$b_boot"; then
+        [ -n "$AP_DRY" ] || rm -f "$AP_PENDING"
+        p_fam="$b_fam"
+        kind="switch"
+        msg="Основным $became $b_name, повод: $reason."
+    else
+        kind="error"
+        msg="После перехода на $b_name имена не открывались, возвращён $p_server."
+    fi
+
+    # The backup server has to be reachable when the primary one is not, so it is of
+    # another family and NextDNS goes first while it is good and fast enough. It is
+    # changed only when the current one fails the check, is of the family of the
+    # primary one or is slow. Changing it restarts only the watching service
+    local bb="" bb_name bb_url cb cb_good=0 cb_score=99999 cb_fam="" b_reason=""
+    grep "^1|" "$dir/res" | awk -F"|" -v f="$p_fam" '$8 != f' > "$dir/backup"
+    bb=$(awk -F"|" -v id="$AP_BACKUP_FIRST" -v max="$AP_BACKUP_MAX" '$4 == id && $2 <= max' "$dir/backup" | head -n 1)
+    [ -n "$bb" ] || bb=$(sort -t"|" -k2,2n "$dir/backup" | head -n 1)
+    if [ -n "$bb" ]; then
+        IFS="|" read -r good b_score low id bb_name bb_url boot fam med ok << EOF
+$bb
+EOF
+        cb=$(awk -F"|" -v u="$FO_SERVER" '$6 == u' "$dir/res" | head -n 1)
+        if [ -n "$cb" ]; then
+            IFS="|" read -r cb_good cb_score low id name url boot cb_fam med ok << EOF
+$cb
+EOF
+        fi
+        if [ -z "$FO_SERVER" ]; then
+            b_reason="резервного не было"
+        elif [ "$FO_TYPE" != "doh" ]; then
+            b_reason="резервный работал не через DoH"
+        elif [ "$FO_SERVER" = "$bb_url" ]; then
+            b_reason=""
+        elif [ "$cb_good" -ne 1 ]; then
+            b_reason="резервный $FO_SERVER не прошёл проверку"
+        elif [ "$cb_fam" = "$p_fam" ]; then
+            b_reason="резервный от того же сервиса, что и основной"
+        elif [ "$cb_score" -gt "$AP_BACKUP_MAX" ]; then
+            b_reason="резервный отвечает за $cb_score мс"
+        fi
+        if [ -n "$b_reason" ]; then
+            if [ -z "$AP_DRY" ]; then
+                fo_save doh "$bb_url"
+                fo_setup restart >/dev/null 2>&1
+            fi
+            [ "$kind" = "keep" ] && kind="switch"
+            msg="${msg:+$msg }Резервным $became $bb_name, повод: $b_reason."
+        fi
+    fi
+
+    ap_log "$kind" "Лучшие: $top. ${msg:-Текущие серверы в порядке, ничего не менялось.}"
+    rm -rf "$dir"
+}
+
+# Starts the measurement from the page; it takes longer than a LuCI call may wait
+action_autopick_start() {
+    mkdir -p "$STATE_DIR"
+    if ap_running; then
+        echo '{"status": "running"}'
+        return 0
+    fi
+    # the run writes its own pid
+    "$0" autopick < /dev/null > /dev/null 2>&1 &
+    echo '{"status": "started"}'
+}
+
+# Writes the line of the daily run into the crontab of root, or removes it
+ap_cron() {
+    local tab="/etc/crontabs/root" en tm h m
+    en=$(uci -q get dns-checker.autopick.enabled || echo 0)
+    tm=$(uci -q get dns-checker.autopick.time || echo "$AP_TIME_DEFAULT")
+    h=$(echo "${tm%%:*}" | sed 's/^0\(.\)/\1/')
+    m=$(echo "${tm#*:}" | sed 's/^0\(.\)/\1/')
+    mkdir -p /etc/crontabs
+    touch "$tab"
+    grep -v -F "$AP_MARK" "$tab" > "$tab.dns-checker"
+    [ "$en" = "1" ] && echo "$m $h * * * /usr/bin/dns-checker-engine autopick >/dev/null 2>&1 $AP_MARK" >> "$tab.dns-checker"
+    if ! cmp -s "$tab" "$tab.dns-checker"; then
+        mv -f "$tab.dns-checker" "$tab"
+        /etc/init.d/cron restart >/dev/null 2>&1
+    else
+        rm -f "$tab.dns-checker"
+    fi
+}
+
+action_autopick_set() {
+    local en="$1" tm="$2"
+    case "$en" in 0|1) ;; *) en=0 ;; esac
+    case "$tm" in
+        [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+        *)
+            echo '{"status": "error", "message": "Время нужно указать как ЧЧ:ММ"}'
+            return 0
+            ;;
+    esac
+    uci set dns-checker.autopick=autopick
+    uci set dns-checker.autopick.enabled="$en"
+    uci set dns-checker.autopick.time="$tm"
+    uci commit dns-checker
+    ap_cron
+    echo '{"status": "ok"}'
+}
+
+# ------------------------------------------------------------------------------
 # Action: Apply Primary Podkop DNS
 # ------------------------------------------------------------------------------
 action_apply_primary() {
@@ -1189,8 +1577,17 @@ case "$1" in
     failover_setup)
         fo_setup "$2"
         ;;
+    autopick)
+        action_autopick "$2"
+        ;;
+    autopick_start)
+        action_autopick_start
+        ;;
+    autopick_set)
+        action_autopick_set "$2" "$3"
+        ;;
     *)
-        echo "Usage: $0 {test|test_start|test_result|status|leak_test|check_update|add_custom|del_custom|backup|restore|update|apply_primary|apply_backup|apply_wan|apply|failover_check|failover_setup}"
+        echo "Usage: $0 {test|test_start|test_result|status|leak_test|check_update|add_custom|del_custom|backup|restore|update|apply_primary|apply_backup|apply_wan|apply|failover_check|failover_setup|autopick [dry]|autopick_start|autopick_set <0|1> <HH:MM>}"
         exit 1
         ;;
 esac
