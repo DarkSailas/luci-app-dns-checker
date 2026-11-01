@@ -32,6 +32,10 @@ FO_RESERVE="195.208.5.1 62.76.62.76"
 SB_CONFIG=$(uci -q get podkop.settings.config_path)
 [ -n "$SB_CONFIG" ] || SB_CONFIG="/etc/sing-box/config.json"
 
+is_ip() {
+    echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
 # Where to send a DoH or DoT probe. The resolver of the router goes through the DNS
 # in use, and a provider may answer with a stub for its own name (COMSS gives
 # 127.0.1.1), or podkop may give a fake address. Then the name is asked from the
@@ -155,9 +159,11 @@ EOF
                         else
                             # dig cannot name the host when it is given an address; the time of the
                             # exchange alone is taken, without the connection setup, as dig counts it
-                            out_curl=$(curl -s -o /dev/null -w "%{time_appconnect} %{time_total}" --max-time 2 $(is_ip "$hip" && echo "--resolve $host:443:$hip") "$doh?dns=AAABAAABAAAAAAAAA3d3dwZnb29nbGUDY29tAAABAAE" -H "accept: application/dns-message" 2>/dev/null)
-                            if [ $? -eq 0 ] && [ -n "$out_curl" ] && [ "${out_curl#* }" != "0.000000" ]; then
-                                ms=$(echo "$out_curl" | awk '{print int(($2 - $1) * 1000)}')
+                            out_curl=$(curl -s -o /dev/null -w "%{http_code} %{time_appconnect} %{time_total}" --max-time 2 $(is_ip "$hip" && echo "--resolve $host:443:$hip") "$doh?dns=AAABAAABAAAAAAAAA3d3dwZnb29nbGUDY29tAAABAAE" -H "accept: application/dns-message" 2>/dev/null)
+                            local http_code="${out_curl%% *}"
+                            if [ "$http_code" = "200" ]; then
+                                ms=$(echo "$out_curl" | awk '{print int(($3 - $2) * 1000)}')
+                                [ -z "$ms" ] && ms=0
                                 d_sum=$((d_sum + ms))
                                 d_cnt=$((d_cnt + 1))
                             elif [ "$d_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
